@@ -1,0 +1,332 @@
+---
+- name: Durcissement serveur Debian (Apache + MariaDB + DVWA)
+  hosts: debian-server
+  become: yes
+
+  vars:
+    mariadb_root_password: "ChangeMeStrongRootPass!"   # ⚠️ change ce mot de passe
+    allowed_ssh_source: "ip autorisé"               # réseau autorisé pour SSH
+    ssh_port: 2222                                    # nouveau port SSH
+    allow_http: true                                  # garder HTTP
+    admin_ip: "admin ip"                          # IP admin autorisée sur dossiers sensibles
+
+  pre_tasks:
+    - name: Mettre à jour le cache APT
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Créer un dossier de sauvegarde pour les configs
+      file:
+        path: /root/hardening_backups
+        state: directory
+        mode: '0700'
+
+  tasks:
+    ######################################################################
+    # 🛠️ Installation & activation services
+    ######################################################################
+    - name: Installer les paquets nécessaires
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - gnupg
+          - lsb-release
+          - unattended-upgrades
+          - ufw
+          - fail2ban
+          - auditd
+          - aide
+          - apparmor
+          - apparmor-utils
+          - libapache2-mod-security2
+          - libapache2-mod-evasive
+          - apache2
+          - mariadb-server
+          - php
+          - php-mysqli
+          - php-gd
+          - libapache2-mod-php
+          - unzip
+          - openssl
+        state: present
+        update_cache: yes
+
+    - name: Activer Apache et MariaDB
+      service:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - apache2
+        - mysql
+
+    ######################################################################
+    # 🔐 Apache + DVWA Hardening
+    ######################################################################
+    - name: Désactiver ServerSignature et ServerTokens
+      lineinfile:
+        path: /etc/apache2/conf-available/security.conf
+        regexp: '^Server(Signature|Tokens)'
+        line: "{{ item }}"
+        create: yes
+      loop:
+        - "ServerSignature Off"
+        - "ServerTokens Prod"
+      notify: reload apache
+
+    - name: Configurer DVWA avec restrictions IP et headers de sécurité
+      copy:
+        dest: /etc/apache2/conf-available/dvwa-security.conf
+        content: |
+          <Directory /var/www/html/dvwa>
+              Options -Indexes -FollowSymLinks
+              AllowOverride All
+              Require all granted
+          </Directory>
+
+          <Directory /var/www/html/dvwa/config>
+              Require ip {{ admin_ip }}
+          </Directory>
+
+          <Directory /var/www/html/dvwa/tests>
+              Require ip {{ admin_ip }}
+          </Directory>
+
+          <Directory /var/www/html/dvwa/database>
+              Require ip {{ admin_ip }}
+          </Directory>
+
+          <IfModule mod_headers.c>
+            Header always set X-Frame-Options "SAMEORIGIN"
+            Header always set X-Content-Type-Options "nosniff"
+            Header always set X-XSS-Protection "1; mode=block"
+            Header always set Referrer-Policy "no-referrer-when-downgrade"
+            Header always set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; object-src 'none';"
+          </IfModule>
+      notify: reload apache
+
+    - name: Activer la conf DVWA sécurité
+      file:
+        src: /etc/apache2/conf-available/dvwa-security.conf
+        dest: /etc/apache2/conf-enabled/dvwa-security.conf
+        state: link
+      notify: reload apache
+
+    ######################################################################
+    # 🔑 SSH Hardening
+    ######################################################################
+    - name: Sauvegarder la configuration SSH
+      copy:
+        src: /etc/ssh/sshd_config
+        dest: /root/hardening_backups/sshd_config.bak
+        remote_src: yes
+
+    - name: Configurer SSH (port et root interdit)
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^#?{{ item.key }}'
+        line: "{{ item.key }} {{ item.value }}"
+      loop:
+        - { key: "Port", value: "{{ ssh_port }}" }
+        - { key: "PermitRootLogin", value: "no" }
+      notify: restart ssh
+
+    ######################################################################
+    # 🔥 Pare-feu UFW
+    ######################################################################
+    - name: Activer UFW avec politique par défaut restrictive
+      ufw:
+        state: enabled
+        policy: deny
+        direction: incoming
+
+    - name: Autoriser SSH sur le nouveau port
+      ufw:
+        rule: allow
+        port: "{{ ssh_port }}"
+        proto: tcp
+        from_ip: "{{ allowed_ssh_source }}"
+
+    - name: Autoriser HTTP
+      ufw:
+        rule: allow
+        port: 80
+        proto: tcp
+
+    ######################################################################
+    # 🛡️ Fail2ban
+    ######################################################################
+    - name: Configurer Fail2ban
+      copy:
+        dest: /etc/fail2ban/jail.d/hardening.local
+        content: |
+          [sshd]
+          enabled = true
+          port = {{ ssh_port }}
+          maxretry = 5
+          bantime = 3600
+
+          [apache-auth]
+          enabled = true
+          port = http
+          filter = apache-auth
+          logpath: /var/log/apache2/*error.log
+          maxretry = 5
+          bantime = 3600
+      notify: restart fail2ban
+
+    ######################################################################
+    # 🔒 Autres bonnes pratiques de durcissement
+    ######################################################################
+    - name: Appliquer une politique de mot de passe fort
+      lineinfile:
+        path: /etc/security/pwquality.conf
+        regexp: '^{{ item.key }}'
+        line: "{{ item.key }} = {{ item.value }}"
+      loop:
+        - { key: "minlen", value: "12" }
+        - { key: "ucredit", value: "-1" }
+        - { key: "lcredit", value: "-1" }
+        - { key: "dcredit", value: "-1" }
+        - { key: "ocredit", value: "-1" }
+
+    - name: Journaliser toutes les utilisations de sudo
+      lineinfile:
+        path: /etc/sudoers
+        regexp: '^Defaults\s+logfile'
+        line: "Defaults logfile=/var/log/sudo.log"
+        state: present
+
+    - name: Activer les mises à jour automatiques de sécurité
+      copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Unattended-Upgrade "1";
+
+    - name: Appliquer des paramètres sysctl sécurisés
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        state: present
+        reload: yes
+      loop:
+        - { key: "net.ipv4.ip_forward", value: "0" }
+        - { key: "net.ipv4.conf.all.accept_redirects", value: "0" }
+        - { key: "net.ipv6.conf.all.accept_redirects", value: "0" }
+        - { key: "net.ipv4.conf.all.send_redirects", value: "0" }
+        - { key: "net.ipv4.conf.all.accept_source_route", value: "0" }
+
+    - name: Déplacer la DB AIDE initialisée en place (si créée)
+      command: mv /var/lib/aide/aide.db.new /var/lib/aide/aide.db
+      args:
+        removes: /var/lib/aide/aide.db.new
+
+    - name: Interdire les core dumps système (limits)
+      copy:
+        dest: /etc/security/limits.d/99-hardening.conf
+        content: |
+          * hard core 0
+
+    - name: Assurer sysctl pour ne pas permettre dump setuid
+      sysctl:
+        name: fs.suid_dumpable
+        value: 0
+        state: present
+        reload: yes
+
+    ######################################################################
+    # 🔐 Sécurisation MariaDB
+    ######################################################################
+    - name: Configurer root pour utiliser mot de passe (mysql_native_password)
+      community.mysql.mysql_user:
+        name: root
+        host: localhost
+        password: "{{ mariadb_root_password }}"
+        plugin: mysql_native_password
+        state: present
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+
+    - name: Supprimer les utilisateurs anonymes
+      community.mysql.mysql_user:
+        name: ''
+        host_all: true
+        state: absent
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+
+    - name: Supprimer la base de test
+      community.mysql.mysql_db:
+        name: test
+        state: absent
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+
+    - name: Supprimer accès root distant
+      community.mysql.mysql_user:
+        name: root
+        host: "{{ item }}"
+        state: absent
+        login_user: root
+        login_password: "{{ mariadb_root_password }}"
+      loop:
+        - "%"
+        - "::1"
+
+    - name: Désactiver le chargement de fichiers distants
+      lineinfile:
+        path: /etc/mysql/mariadb.conf.d/50-server.cnf
+        regexp: '^local_infile'
+        line: "local_infile = 0"
+      notify: restart mysql
+
+    - name: Activer le log des requêtes lentes
+      blockinfile:
+        path: /etc/mysql/mariadb.conf.d/50-server.cnf
+        block: |
+          slow_query_log = 1
+          slow_query_log_file = /var/log/mysql/mariadb-slow.log
+          long_query_time = 2
+      notify: restart mysql
+
+
+    ######################################################################
+    # ⚙️ Sécurisation PHP
+    ######################################################################
+    - name: Restreindre les fonctions PHP dangereuses
+      lineinfile:
+        path: "/etc/php/8.4/apache2/php.ini"
+        regexp: '^disable_functions'
+        line: "disable_functions = exec,passthru,shell_exec,system,proc_open,popen,curl_exec,curl_multi_exec,parse_ini_file,show_source"
+      with_fileglob:
+        - "/etc/php/*/apache2/php.ini"
+      notify: restart apache
+
+  handlers:
+    - name: reload apache
+      service:
+        name: apache2
+        state: reloaded
+
+    - name: restart apache
+      service:
+        name: apache2
+        state: restarted
+
+    - name: restart ssh
+      service:
+        name: ssh
+        state: restarted
+
+    - name: restart fail2ban
+      service:
+        name: fail2ban
+        state: restarted
+
+    - name: restart mysql
+      service:
+        name: mysql
+        state: restarted
