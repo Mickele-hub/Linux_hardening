@@ -44,7 +44,7 @@ MariaDB
 
 🚀 Utilisation
 .Cloner le projet
-.cd debian-server-hardening
+.Créer un dossier pour le playbook avec l'inventaire
 .Exécuter le playbook : -ansible-playbook -i inventory linux-hardening.yml
 ⚠️ Avertissement
 
